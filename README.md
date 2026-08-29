@@ -46,17 +46,30 @@ git remote set-url origin https://github.com/YOU/x402-facilitator
 git push -u origin main
 ```
 
-Then on [Render](https://render.com/new): connect repo, set `PAYMENT_ADDRESS` to your Base USDC wallet, deploy.
+Then on [Render](https://render.com/new): connect the repo and set the two required variables.
+
+| Variable | Required | Notes |
+|---|---|---|
+| `PAYMENT_ADDRESS` | yes | Your Base address. No default — the service refuses to start without it. |
+| `WEBHOOK_SECRET` | yes | `openssl rand -hex 32`. Rejected if left as `changeme`. |
+| `ALLOWED_ORIGINS` | no | Comma-separated origins allowed to call it from a browser. |
+| `BASE_RPC_URL` | no | Defaults to the public Base endpoint, which is rate-limited. |
+| `MIN_CONFIRMATIONS` | no | Defaults to `2`. |
+
+Both required variables fail closed at startup rather than falling back to a
+default, because the failure mode of a default payment address is that money
+lands somewhere nobody can spend it from.
 
 ## Endpoints
 
 | Endpoint | Method | What it does |
 |---|---|---|
 | `/pay` | POST | Create payment challenge, returns HTTP 402 |
+| `/support` | POST | Donation challenge — same rails, nothing owed in return |
 | `/pay/{id}` | GET | Check payment status |
-| `/webhook` | POST | Submit payment proof, triggers on-chain verification |
+| `/webhook` | POST | Submit settlement proof. Signed **and** verified on-chain |
+| `/verify-onchain` | POST | Check a transaction without settling it |
 | `/buy/{product}` | GET/POST | Preconfigured product checkout |
-| `/verify-onchain` | POST | Verify tx on Base mainnet |
 
 ## Quick usage
 
@@ -88,18 +101,25 @@ curl https://x402-facilitator.onrender.com/buy/music-track
 curl https://x402-facilitator.onrender.com/buy/rug-score
 ```
 
-### Verify after payment
+### Settle after payment
+
+`/webhook` requires an HMAC-SHA256 signature over the raw request body, in the
+`X-Signature` header. The amount is **not** taken from the request — it comes
+from the stored challenge and is checked against the chain.
 
 ```bash
+BODY='{"payment_id":"abc123","tx_hash":"0x..."}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | sed 's/.* //')
+
 curl -X POST https://x402-facilitator.onrender.com/webhook \
   -H "Content-Type: application/json" \
-  -d '{
-    "payment_id": "abc123",
-    "tx_hash": "0x...",
-    "amount": 100,
-    "sender": "0x..."
-  }'
+  -H "X-Signature: $SIG" \
+  -d "$BODY"
 ```
+
+A request without a valid signature returns `401`. A signed request whose
+transaction did not actually move the full amount to `PAYMENT_ADDRESS` returns
+`402` with the reason.
 
 ## Default product catalog
 
@@ -118,45 +138,86 @@ Edit `main.py` to customize.
 ## Integration example
 
 ```js
-// 1. Request the resource
+// 1. Request the resource. A 402 carries the challenge.
 const res = await fetch('https://your-x402.example.com/buy/sweater');
 const challenge = await res.json();
 
-// 2. Show payment UI — Coinbase Pay, QR code, or deep link
-window.location.href =
-  `https://pay.coinbase.com/buy?address=${challenge.pay_to}&amount=${challenge.amount}`;
+// 2. Hand the user a payment request. `qr_data` is an EIP-681 URI naming the
+//    token and the chain, so there is nothing for them to select by hand.
+//    Render it as a QR code, or use it as a deep link:
+window.location.href = challenge.qr_data;
+// ethereum:0x8335…2913@8453/transfer?address=0x…&uint256=100000000
 
-// 3. After user pays, verify on-chain
-await fetch('https://your-x402.example.com/webhook', {
-  method: 'POST',
-  body: JSON.stringify({
-    payment_id: challenge.payment_id,
-    tx_hash: userTxHash,
-    amount: challenge.amount,
-    sender: userWallet,
-  }),
-});
+// 3. Settle from your SERVER, never the browser — the signature requires
+//    WEBHOOK_SECRET, which must not ship to a client.
+//    POST { payment_id, tx_hash } with an X-Signature header.
 ```
+
+The `qr_data` URI targets the **token contract**, with the recipient as the
+`transfer` argument. The arrangement that reads more naturally — recipient as
+the target, amount in a `value` parameter — asks the wallet for native ETH
+instead, and delivers no USDC at all.
 
 ## Architecture
 
 ```
 x402-facilitator/
-├── main.py            # FastAPI app: routes, payment state, verification
-├── requirements.txt   # FastAPI, uvicorn, web3, httpx
-├── render.yaml        # Render deployment config
-└── .env.example       # PAYMENT_ADDRESS, BASE_RPC_URL, etc.
+├── main.py                # FastAPI app: routes, payment state, verification
+├── test_main.py           # Settlement-path tests, mostly adversarial
+├── requirements.txt       # FastAPI, uvicorn, httpx, pydantic
+├── requirements-dev.txt   # + pytest
+├── render.yaml            # Render deployment config
+└── .env.example           # PAYMENT_ADDRESS, WEBHOOK_SECRET, etc.
 ```
 
 ## Security posture
 
-Before using in production:
+Two independent checks stand between a request and a payment marked settled,
+and both are mandatory:
 
-- ✅ `/verify-onchain` confirms tx exists, is mined, correct recipient, correct amount
-- ✅ `/webhook` rejects duplicate payment_ids (replay protection)
-- ⚠️ State is in-memory by default — restart loses pending payments. **For production: enable the Postgres backend in `main.py`** (see `docs/PERSISTENCE.md`)
-- ⚠️ No rate limiting by default — add Cloudflare or your reverse proxy of choice
-- ⚠️ Free-tier Render sleeps after 15 min idle — use the $7/mo Starter plan minimum
+1. **An HMAC signature** over the raw request body proves the caller holds
+   `WEBHOOK_SECRET`.
+2. **The chain** proves the money moved, via the USDC `Transfer` log in the
+   transaction receipt.
+
+Neither is sufficient alone. A signature says who is asking, not that anyone
+paid. A transaction hash says money moved, not that it was for this order.
+
+What settlement verifies:
+
+- ✅ Signature present and valid — a missing `X-Signature` is `401`, not a pass
+- ✅ Transaction mined and not reverted
+- ✅ At least `MIN_CONFIRMATIONS` deep
+- ✅ Transfer emitted by the **USDC contract** — an arbitrary token does not count
+- ✅ Recipient is `PAYMENT_ADDRESS`
+- ✅ Amount is at least the challenge amount, taken from stored state rather than
+  from the request body
+- ✅ One transaction settles one payment — reuse returns `409`
+- ✅ Re-settling a paid payment is idempotent, not a double credit
+
+Still worth knowing:
+
+- ⚠️ State is in-memory by default; a restart drops **pending** payments. Settled
+  ones are recoverable from the chain. Set `SUPABASE_URL`/`SUPABASE_KEY` to persist.
+- ⚠️ No rate limiting by default — put Cloudflare or a reverse proxy in front
+- ⚠️ Free-tier Render sleeps after 15 min idle — Starter plan minimum for real use
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+### Upgrading from 1.x
+
+Three breaking changes, all of them closing holes:
+
+1. `X-Signature` on `/webhook` is now **required**. Previously the signature was
+   verified only when the header happened to be present, so omitting it skipped
+   verification entirely and any caller could mark any payment paid.
+2. `/webhook` no longer accepts `amount` or `sender` from the request body. The
+   amount is read from the stored challenge and checked against the chain.
+3. `PAYMENT_ADDRESS` and `WEBHOOK_SECRET` have no defaults and the service will
+   not start without them.
 
 ## Need integration help?
 
