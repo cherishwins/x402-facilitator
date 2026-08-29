@@ -4,11 +4,20 @@ services:
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
+      # No default and no generated value: this must be an address whose keys
+      # you actually hold, set by hand.
       - key: PAYMENT_ADDRESS
         sync: false
       - key: WEBHOOK_SECRET
         generateValue: true
+      - key: ALLOWED_ORIGINS
+        value: https://kim.juche.org
+      - key: BASE_RPC_URL
+        sync: false
+      - key: MIN_CONFIRMATIONS
+        value: "2"
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
