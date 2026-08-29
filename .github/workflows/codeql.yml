@@ -1,5 +1,11 @@
 name: "CodeQL"
 
+# NOTE: this repository is private. Code scanning on a private repository
+# requires GitHub Advanced Security to be enabled for it. Without GHAS the
+# analyze step fails with "Advanced Security must be enabled for this
+# repository to use code scanning". If GHAS is not on this plan, delete this
+# workflow; tests.yml carries the protection that actually matters here.
+
 on:
   push:
     branches: [ "main" ]
@@ -26,6 +32,12 @@ jobs:
       security-events: write
       # Read the source.
       contents: read
+      # Both of these are required because this repository is PRIVATE:
+      # actions: read lets CodeQL read workflow run data, and packages: read
+      # lets it fetch private CodeQL query packs. On a public repo they are
+      # surplus; here they are load-bearing.
+      actions: read
+      packages: read
 
     steps:
       - name: Checkout repository
