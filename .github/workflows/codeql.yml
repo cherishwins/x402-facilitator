@@ -1,0 +1,46 @@
+name: "CodeQL"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    # Weekly. The scheduled run exists to catch newly published advisories
+    # against code that has not changed, so it must not depend on a push.
+    - cron: '45 13 * * 1'
+
+# A newer push supersedes the run in flight. No reason to pay for both.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      # Upload findings to the Security tab.
+      security-events: write
+      # Read the source.
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: python
+          build-mode: none
+          # The default pack is deliberately conservative. This service
+          # verifies payment settlement, so take the broader security pack.
+          queries: security-extended
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:python"
